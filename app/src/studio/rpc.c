@@ -78,6 +78,31 @@ static enum studio_framing_state rpc_framing_state;
 static K_MUTEX_DEFINE(rpc_transport_mutex);
 static struct zmk_rpc_transport *selected_transport;
 
+/*
+ * Notifications are best-effort; responses are not.
+ *
+ * A response answers a request, so a client is there reading. A notification
+ * is sent whether or not anyone is: with the USB transport selected but no
+ * app holding the serial port open, the host never drains the CDC ACM
+ * endpoint, the TX ring buffer fills, and the writer below used to sleep and
+ * retry for ever -- on whichever thread raised the event, holding
+ * rpc_transport_mutex. Battery updates raise a notification from the
+ * low-priority work queue every report interval, so that queue froze until
+ * the watchdog rebooted the keyboard, and everything else that notifies
+ * (the system work queue included) piled up behind the mutex.
+ *
+ * So a notification waits at most NOTIFICATION_TX_WAIT_MS for room for the
+ * whole message and is otherwise dropped, without writing a partial frame.
+ * After one drop the transport counts as stalled and further notifications
+ * are dropped at once, until the buffer has room again or a request arrives
+ * (either means the host is reading).
+ */
+#define NOTIFICATION_TX_WAIT_MS 200
+
+static bool tx_stalled;
+/* Absolute uptime after which the current write gives up; 0 = never. */
+static int64_t tx_deadline;
+
 struct ring_buf *zmk_rpc_get_rx_buf(void) { return &rpc_rx_buf; }
 
 void zmk_rpc_rx_notify(void) { k_sem_give(&rpc_rx_sem); }
@@ -131,6 +156,12 @@ static bool rpc_tx_buffer_write(pb_ostream_t *stream, const uint8_t *buf, size_t
         uint32_t claim_len = ring_buf_put_claim(&rpc_tx_buf, &write_buf, count - written);
 
         if (claim_len == 0) {
+            if (tx_deadline != 0 && k_uptime_get() >= tx_deadline) {
+                /* A notification larger than the buffer, and the host stopped
+                 * reading partway through. See NOTIFICATION_TX_WAIT_MS. */
+                tx_stalled = true;
+                return false;
+            }
             /* The TX ring buffer is full. Kick the transport to drain it and
              * free space before we sleep, otherwise we would just spin here
              * waiting for a flush that nothing else is going to trigger. The
@@ -183,6 +214,31 @@ static pb_ostream_t pb_ostream_for_tx_buf(void *user_data) {
     return stream;
 }
 
+/* Wait (bounded) until `needed` bytes fit in the TX buffer. */
+static bool wait_for_tx_space(size_t needed, void *user_data) {
+    needed = MIN(needed, ring_buf_capacity_get(&rpc_tx_buf));
+
+    if (ring_buf_space_get(&rpc_tx_buf) >= needed) {
+        tx_stalled = false;
+        return true;
+    }
+    if (tx_stalled) {
+        return false;
+    }
+
+    const int64_t until = k_uptime_get() + NOTIFICATION_TX_WAIT_MS;
+    do {
+        selected_transport->tx_notify(&rpc_tx_buf, 0, false, user_data);
+        k_sleep(K_MSEC(1));
+        if (ring_buf_space_get(&rpc_tx_buf) >= needed) {
+            return true;
+        }
+    } while (k_uptime_get() < until);
+
+    tx_stalled = true;
+    return false;
+}
+
 static int send_response(const zmk_studio_Response *resp) {
     int err = 0;
     k_mutex_lock(&rpc_transport_mutex, K_FOREVER);
@@ -192,6 +248,26 @@ static int send_response(const zmk_studio_Response *resp) {
     }
 
     void *user_data = selected_transport->tx_user_data ? selected_transport->tx_user_data() : NULL;
+
+    const bool is_notification = resp->which_type == zmk_studio_Response_notification_tag;
+    if (is_notification) {
+        size_t encoded_size = 0;
+        if (!pb_get_encoded_size(&encoded_size, &zmk_studio_Response_msg, resp)) {
+            err = -EINVAL;
+            goto exit;
+        }
+        /* Worst case every byte is escaped, plus the SOF and EOF bytes. */
+        if (!wait_for_tx_space(2 * encoded_size + 2, user_data)) {
+            LOG_DBG("Studio host is not reading; dropped a notification");
+            err = -EAGAIN;
+            goto exit;
+        }
+        tx_deadline = k_uptime_get() + NOTIFICATION_TX_WAIT_MS;
+    } else {
+        /* A request just arrived, so the host is reading. */
+        tx_stalled = false;
+        tx_deadline = 0;
+    }
 
     pb_ostream_t stream = pb_ostream_for_tx_buf(user_data);
 
@@ -216,13 +292,18 @@ static int send_response(const zmk_studio_Response *resp) {
     bool status = pb_encode(&stream, &zmk_studio_Response_msg, resp);
 
     if (!status) {
+        if (tx_stalled) {
+            LOG_DBG("Studio host stopped reading; dropped a notification mid-frame");
+            err = -EAGAIN;
+            goto exit;
+        }
 #if !IS_ENABLED(CONFIG_NANOPB_NO_ERRMSG)
         LOG_ERR("Failed to encode the message %s", stream.errmsg);
 #else
         LOG_ERR("Failed to encode the message");
 #endif // !IS_ENABLED(CONFIG_NANOPB_NO_ERRMSG)
-        k_mutex_unlock(&rpc_transport_mutex);
-        return -EINVAL;
+        err = -EINVAL;
+        goto exit;
     }
 
     framing_byte = FRAMING_EOF;
@@ -244,6 +325,7 @@ static int send_response(const zmk_studio_Response *resp) {
     selected_transport->tx_notify(&rpc_tx_buf, 1, true, user_data);
 
 exit:
+    tx_deadline = 0;
     k_mutex_unlock(&rpc_transport_mutex);
     return err;
 }
