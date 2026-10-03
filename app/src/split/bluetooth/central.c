@@ -146,6 +146,26 @@ static struct peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
 static bool is_scanning = false;
 
+/*
+ * Two scan duty cycles. BT_LE_SCAN_PASSIVE in this firmware's Zephyr is 40 ms
+ * in every 500 ms (8%), chosen so a central whose peripheral is away does
+ * not drain a coin cell by listening half the time. But that is also how
+ * long a wake from deep sleep takes to find the other half: the peripheral
+ * advertises directed at us, and with the window open 8% of the time it is
+ * seconds before an advertisement lands in it. So the first stretch of
+ * scanning after boot, and after a peripheral drops, runs at the full duty
+ * cycle Zephyr uses by default (30 ms in every 60 ms); the slow cycle takes
+ * over once that stretch has passed without a connection.
+ */
+#define SCAN_FAST_PERIOD_MS 20000
+#define BT_LE_SCAN_PASSIVE_FAST                                                                    \
+    BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_PASSIVE, BT_LE_SCAN_OPT_FILTER_DUPLICATE,                     \
+                     BT_GAP_SCAN_FAST_INTERVAL, BT_GAP_SCAN_FAST_WINDOW)
+
+static bool scan_fast = true;
+static void scan_slowdown_work_cb(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(scan_slowdown_work, scan_slowdown_work_cb);
+
 static const struct bt_uuid_128 split_service_uuid = BT_UUID_INIT_128(ZMK_SPLIT_BT_SERVICE_UUID);
 
 struct peripheral_event_wrapper {
@@ -1146,14 +1166,45 @@ static int start_scanning(void) {
 
     // Start scanning otherwise.
     is_scanning = true;
-    int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
+    int err = bt_le_scan_start(scan_fast ? BT_LE_SCAN_PASSIVE_FAST : BT_LE_SCAN_PASSIVE,
+                               split_central_device_found);
     if (err < 0) {
         LOG_ERR("Scanning failed to start (err %d)", err);
         return err;
     }
 
-    LOG_DBG("Scanning successfully started");
+    if (scan_fast) {
+        k_work_schedule(&scan_slowdown_work, K_MSEC(SCAN_FAST_PERIOD_MS));
+    }
+    LOG_DBG("Scanning successfully started (%s duty)", scan_fast ? "full" : "low");
     return 0;
+}
+
+/* The fast stretch is over and no peripheral has turned up: scan at the
+ * battery-saving duty cycle from here on, until something changes again. */
+static void scan_slowdown_work_cb(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (!scan_fast) {
+        return;
+    }
+    scan_fast = false;
+    if (!is_scanning) {
+        return;
+    }
+    int err = bt_le_scan_stop();
+    if (err < 0) {
+        LOG_WRN("Could not restart scanning at the low duty cycle (%d)", err);
+        return;
+    }
+    is_scanning = false;
+    start_scanning();
+}
+
+/* A peripheral has just gone (or we have just started): look hard for it. */
+static void scan_want_fast(void) {
+    scan_fast = true;
+    k_work_cancel_delayable(&scan_slowdown_work);
 }
 
 static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
@@ -1217,6 +1268,7 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     k_work_submit(&notify_status_work);
 
+    scan_want_fast();
     start_scanning();
 }
 
