@@ -59,6 +59,25 @@ enum advertising_type {
     BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_NAME | BT_LE_ADV_OPT_FORCE_NAME_IN_AD,  \
                     BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL)
 
+/*
+ * The same, at the fastest interval the spec allows for connectable
+ * advertising (30 to 60 ms instead of 100 to 150 ms), for the first stretch
+ * after boot and after the host drops. A host reconnecting to a bonded
+ * keyboard listens in short windows every so often; packets twice as often
+ * halve the wait for one to land in a window. This is most of what a person
+ * feels as "it takes a while to wake up" on a keyboard that sleeps. The
+ * normal interval takes over after the stretch, since advertising at this
+ * rate for hours would cost real battery on a keyboard nobody is pairing.
+ */
+#define ZMK_ADV_CONN_NAME_FAST                                                                     \
+    BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_NAME | BT_LE_ADV_OPT_FORCE_NAME_IN_AD,  \
+                    BT_GAP_ADV_FAST_INT_MIN_1, BT_GAP_ADV_FAST_INT_MAX_1, NULL)
+#define ZMK_ADV_FAST_PERIOD_MS 30000
+
+static bool adv_fast = true;
+static void adv_slowdown_callback(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(adv_slowdown_work, adv_slowdown_callback);
+
 static struct zmk_ble_profile profiles[ZMK_BLE_PROFILE_COUNT];
 static uint8_t active_profile;
 static bool directed_advertising_enabled = false;
@@ -168,12 +187,16 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
     advertising_status = ZMK_ADV_DIR;
 
 #define CHECKED_OPEN_ADV()                                                                         \
-    err = bt_le_adv_start(ZMK_ADV_CONN_NAME, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);         \
+    err = bt_le_adv_start(adv_fast ? ZMK_ADV_CONN_NAME_FAST : ZMK_ADV_CONN_NAME, zmk_ble_ad,      \
+                          ARRAY_SIZE(zmk_ble_ad), NULL, 0);                                        \
     if (err) {                                                                                     \
         LOG_ERR("Advertising failed to start (err %d)", err);                                      \
         return err;                                                                                \
     }                                                                                              \
-    advertising_status = ZMK_ADV_CONN;
+    advertising_status = ZMK_ADV_CONN;                                                             \
+    if (adv_fast) {                                                                                \
+        k_work_schedule(&adv_slowdown_work, K_MSEC(ZMK_ADV_FAST_PERIOD_MS));                      \
+    }
 
 int update_advertising(void) {
     int err = 0;
@@ -223,6 +246,34 @@ int update_advertising(void) {
 };
 
 static void update_advertising_callback(struct k_work *work) { update_advertising(); }
+
+/* The fast stretch is over with nobody connected: carry on at the normal
+ * interval. Only an open (undirected) advertisement is restarted; anything
+ * else is left exactly as it is. */
+static void adv_slowdown_callback(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (!adv_fast) {
+        return;
+    }
+    adv_fast = false;
+    if (advertising_status != ZMK_ADV_CONN) {
+        return;
+    }
+    int err = bt_le_adv_stop();
+    if (err) {
+        LOG_WRN("Could not restart advertising at the normal interval (err %d)", err);
+        return;
+    }
+    advertising_status = ZMK_ADV_NONE;
+    update_advertising();
+}
+
+/* A host has just gone: advertise hard for a while so it finds us quickly. */
+static void adv_want_fast(void) {
+    adv_fast = true;
+    k_work_cancel_delayable(&adv_slowdown_work);
+}
 
 K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
 
@@ -553,6 +604,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
 
     // We need to do this in a work callback, otherwise the advertising update will still see the
     // connection for a profile as active, and not start advertising yet.
+    adv_want_fast();
     k_work_submit(&update_advertising_work);
 
     if (is_conn_active_profile(conn)) {
