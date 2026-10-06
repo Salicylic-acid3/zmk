@@ -62,7 +62,21 @@ int zmk_input_split_report_peripheral_event(uint8_t reg, uint8_t type, uint16_t 
                             ret);
                 }
             }
-            return input_report(proxy_inputs[i].dev, type, code, value, sync, K_NO_WAIT);
+            /*
+             * A key or button event waits for room in the input queue; a
+             * movement does not. The queue fills with the same peripheral's
+             * movement, and a button release dropped here left the button
+             * counted as pressed at the HID layer, and so held at the host,
+             * until the keyboard was reset. Bounded, so a wedged input
+             * thread cannot hold the work queue hostage.
+             */
+            const k_timeout_t timeout = (type == INPUT_EV_REL) ? K_NO_WAIT : K_MSEC(50);
+            int ret = input_report(proxy_inputs[i].dev, type, code, value, sync, timeout);
+            if (ret < 0 && type != INPUT_EV_REL) {
+                LOG_ERR("Peripheral key event %u/%d lost (%d): input queue full for 50 ms",
+                        code, value, ret);
+            }
+            return ret;
         }
     }
 

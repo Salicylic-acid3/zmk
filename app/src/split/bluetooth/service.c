@@ -556,7 +556,26 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
                 .sync = sync ? 1 : 0,
             };
 
-            return bt_gatt_notify(NULL, &split_svc.attrs[i], &payload, sizeof(payload));
+            /*
+             * Movement is sent once and forgotten: there is more behind it.
+             * A key or button event is retried while the stack is out of
+             * buffers, because losing a release leaves the key held on the
+             * central -- for a mouse button, which the HID layer counts, for
+             * good. This runs on the input thread, so waiting here only
+             * delays the movement queued behind it.
+             */
+            int err = bt_gatt_notify(NULL, &split_svc.attrs[i], &payload, sizeof(payload));
+            if (type != INPUT_EV_KEY) {
+                return err;
+            }
+            for (int attempt = 0; (err == -ENOMEM || err == -EAGAIN) && attempt < 50; attempt++) {
+                k_sleep(K_MSEC(2));
+                err = bt_gatt_notify(NULL, &split_svc.attrs[i], &payload, sizeof(payload));
+            }
+            if (err) {
+                LOG_ERR("Key event %u/%d to the central lost (%d)", code, value, err);
+            }
+            return err;
         }
     }
     return -ENODEV;

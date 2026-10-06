@@ -7,6 +7,7 @@
 #include <zephyr/types.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
+#include <zephyr/input/input.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -180,6 +181,58 @@ void peripheral_event_work_callback(struct k_work *work);
 
 K_WORK_DEFINE(peripheral_event_work, peripheral_event_work_callback);
 
+/*
+ * Whether losing this event leaves state behind. A pointer movement lost is
+ * a pointer that moved a little less; a key or button release lost is a key
+ * held down until the next press and release of the same key, and for a
+ * mouse button, which the HID layer counts, held down for good.
+ */
+static bool peripheral_event_is_stateful(const struct zmk_split_transport_peripheral_event *ev) {
+    switch (ev->type) {
+    case ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT:
+        return true;
+#if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
+    case ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_INPUT_EVENT:
+        return ev->data.input_event.type != INPUT_EV_REL;
+#endif
+    default:
+        return false;
+    }
+}
+
+/*
+ * Queue an event from a peripheral for the work queue, from the Bluetooth
+ * RX context where nothing may wait.
+ *
+ * The queue is CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE deep and was
+ * sized for key positions; a trackpad on the peripheral fills it with
+ * movement several times per connection event, and a put that failed used to
+ * drop the event, whatever it was. Movement can go. A key position or a
+ * button must not: when there is no room for one, the oldest *movement*
+ * event in the queue is discarded to make room, and only if the queue holds
+ * nothing but stateful events is the new one lost -- and then it is said at
+ * error level, because a key will be stuck.
+ */
+static void peripheral_event_enqueue(const struct peripheral_event_wrapper *wrapper) {
+    while (k_msgq_put(&peripheral_event_msgq, wrapper, K_NO_WAIT) != 0) {
+        if (!peripheral_event_is_stateful(&wrapper->event)) {
+            LOG_DBG("Peripheral event queue full, movement dropped");
+            break;
+        }
+
+        struct peripheral_event_wrapper head;
+        if (k_msgq_peek(&peripheral_event_msgq, &head) != 0 ||
+            peripheral_event_is_stateful(&head.event)) {
+            LOG_ERR("Peripheral event queue full of stateful events, event type %d lost",
+                    wrapper->event.type);
+            break;
+        }
+        (void)k_msgq_get(&peripheral_event_msgq, &head, K_NO_WAIT);
+        LOG_WRN("Peripheral event queue full, discarded movement to keep a key event");
+    }
+    k_work_submit(&peripheral_event_work);
+}
+
 int peripheral_slot_index_for_conn(struct bt_conn *conn) {
     for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
         if (peripherals[i].conn == conn) {
@@ -231,8 +284,7 @@ int release_peripheral_slot(int index) {
                                            .pressed = false,
                                        }}}};
 
-                k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-                k_work_submit(&peripheral_event_work);
+                peripheral_event_enqueue(&ev);
             }
         }
     }
@@ -330,8 +382,7 @@ static uint8_t split_central_sensor_notify_func(struct bt_conn *conn,
                                .sensor_index = sensor_event.sensor_index,
                            }}}};
 
-    k_msgq_put(&peripheral_event_msgq, &event_wrapper, K_NO_WAIT);
-    k_work_submit(&peripheral_event_work);
+    peripheral_event_enqueue(&event_wrapper);
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -531,8 +582,7 @@ static uint8_t split_central_relay_event_notify_func(struct bt_conn *conn,
             event_wrapper.event.data.relay_event.header.event_data_size,
             payload->header.event_type_size + payload->header.event_data_size);
 
-    k_msgq_put(&peripheral_event_msgq, &event_wrapper, K_NO_WAIT);
-    k_work_submit(&peripheral_event_work);
+    peripheral_event_enqueue(&event_wrapper);
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -573,8 +623,7 @@ static uint8_t peripheral_input_event_notify_cb(struct bt_conn *conn,
                                        .value = payload.value,
                                    }}}};
 
-            k_msgq_put(&peripheral_event_msgq, &event_wrapper, K_NO_WAIT);
-            k_work_submit(&peripheral_event_work);
+            peripheral_event_enqueue(&event_wrapper);
             break;
         }
     }
@@ -620,8 +669,7 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
                                            .position = position,
                                            .pressed = pressed,
                                        }}}};
-                k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-                k_work_submit(&peripheral_event_work);
+                peripheral_event_enqueue(&ev);
             }
         }
     }
@@ -663,8 +711,7 @@ static uint8_t split_central_battery_level_notify_func(struct bt_conn *conn,
                                .level = battery_level,
                            }}}};
 
-    k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-    k_work_submit(&peripheral_event_work);
+    peripheral_event_enqueue(&ev);
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -707,8 +754,7 @@ static uint8_t split_central_battery_level_read_func(struct bt_conn *conn, uint8
                                .level = battery_level,
                            }}}};
 
-    k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-    k_work_submit(&peripheral_event_work);
+    peripheral_event_enqueue(&ev);
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -1252,8 +1298,7 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
                                .level = 0,
                            }}}};
 
-    k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-    k_work_submit(&peripheral_event_work);
+    peripheral_event_enqueue(&ev);
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
