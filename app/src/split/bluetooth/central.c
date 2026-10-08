@@ -162,6 +162,18 @@ static bool is_scanning = false;
 #define BT_LE_SCAN_PASSIVE_FAST                                                                    \
     BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_PASSIVE, BT_LE_SCAN_OPT_FILTER_DUPLICATE,                     \
                      BT_GAP_SCAN_FAST_INTERVAL, BT_GAP_SCAN_FAST_WINDOW)
+/*
+ * The slow cycle: 30 ms in every 2 s (1.5%), down from Zephyr's 40 in 500
+ * (8%). This is the central's cost for the whole time its peripheral is
+ * asleep and it is not -- on a keyboard with a trackpad, that is every
+ * stretch of mouse work with the typing half idle, which can be hours a
+ * day. At 8% that was most of a milliamp from a pair of coin cells. The
+ * peripheral advertises at the fast interval for its first 30 s awake
+ * (ble.c), so even a 30 ms window every 2 s catches it within a couple of
+ * seconds of its first key press.
+ */
+#define BT_LE_SCAN_PASSIVE_SLOW                                                                    \
+    BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_PASSIVE, BT_LE_SCAN_OPT_FILTER_DUPLICATE, 0x0C80, 0x0030)
 
 static bool scan_fast = true;
 static void scan_slowdown_work_cb(struct k_work *work);
@@ -1212,7 +1224,7 @@ static int start_scanning(void) {
 
     // Start scanning otherwise.
     is_scanning = true;
-    int err = bt_le_scan_start(scan_fast ? BT_LE_SCAN_PASSIVE_FAST : BT_LE_SCAN_PASSIVE,
+    int err = bt_le_scan_start(scan_fast ? BT_LE_SCAN_PASSIVE_FAST : BT_LE_SCAN_PASSIVE_SLOW,
                                split_central_device_found);
     if (err < 0) {
         LOG_ERR("Scanning failed to start (err %d)", err);
