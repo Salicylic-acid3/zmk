@@ -74,6 +74,30 @@ config ZMK_SPLIT_BLE_PREF_TIMEOUT
     int "Supervision timeout to use for split central/peripheral connection"
     default 400
 
+config ZMK_SPLIT_BLE_PACED
+    bool "Slow the split link while the keyboard is idle"
+    help
+      A BLE central transmits on every connection event whether or not it
+      has anything to send, so the short interval chosen for typing latency
+      costs the central the same current while the keyboard sits idle. With
+      this on, the central moves the link to ZMK_SPLIT_BLE_IDLE_INT once
+      ZMK_SPLIT_BLE_IDLE_TIMEOUT_MS have passed without a key, sensor or
+      pointer report from either half, and back to ZMK_SPLIT_BLE_PREF_INT
+      on the next one. The first events after an idle stretch travel at the
+      slow interval.
+
+if ZMK_SPLIT_BLE_PACED
+
+config ZMK_SPLIT_BLE_IDLE_INT
+    int "Connection interval while idle, in 1.25 ms units"
+    default 48
+
+config ZMK_SPLIT_BLE_IDLE_TIMEOUT_MS
+    int "Time without activity before the link slows, in ms"
+    default 3000
+
+endif # ZMK_SPLIT_BLE_PACED
+
 endif # ZMK_SPLIT_ROLE_CENTRAL
 
 if !ZMK_SPLIT_ROLE_CENTRAL

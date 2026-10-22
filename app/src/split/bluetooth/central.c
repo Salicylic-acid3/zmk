@@ -26,6 +26,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/behavior.h>
 #include <zmk/sensors.h>
 #include <zmk/split/transport/central.h>
+#include <zmk/split/bluetooth/central.h>
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/split/bluetooth/service.h>
 #include <zmk/event_manager.h>
@@ -147,6 +148,142 @@ static struct peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
 static bool is_scanning = false;
 
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_PACED)
+/*
+ * The split link at two speeds.
+ *
+ * A BLE central transmits on every connection event whether or not it has
+ * anything to say; slave latency lets the peripheral skip events, never the
+ * central. So the 7.5 ms interval that keeps a key from the other half from
+ * arriving late costs the central the same current while its owner is
+ * reading as while they are typing, and on a pair of coin cells that is most
+ * of the budget. Here the central moves the interval itself: PREF_INT while
+ * there is activity, IDLE_INT once there has been none for IDLE_TIMEOUT_MS.
+ * A central may change the parameters unilaterally -- the peripheral build
+ * has BT_GAP_AUTO_UPDATE_CONN_PARAMS off, so it never asks for its own --
+ * and the link layer applies the change six events on.
+ *
+ * Activity is anything that reaches the host (every key, consumer and
+ * pointer report the central sends, see endpoints.c) and every key, sensor
+ * or input event a peripheral delivers, including ones that produce no
+ * report, such as a layer key. Battery levels, heartbeats and relay traffic
+ * are not activity, or the link would never slow. The first events after an
+ * idle stretch travel at the slow interval, and so do the ones in the six
+ * slow intervals it takes the change to land: with a 60 ms idle interval
+ * that is about a third of a second of slightly late keys at the start of a
+ * burst, during which a key from each half pressed within one interval can
+ * reach the host out of order. The idle timeout keeps that rare; a pause
+ * inside a sentence does not slow the link.
+ *
+ * The controller runs one parameter update at a time and refuses another
+ * while it is in flight, so the change is applied from a delayable work item
+ * that retries until every connected peripheral has taken it. -EALREADY
+ * means the link is at those parameters already.
+ */
+#define PACE_RETRY K_MSEC(50)
+#define PACE_MAX_TRIES 40
+
+int peripheral_slot_index_for_conn(struct bt_conn *conn);
+
+static atomic_t pace_fast = ATOMIC_INIT(1);
+static uint8_t pace_tries;
+
+static void pace_apply_work_cb(struct k_work *work);
+static void pace_idle_work_cb(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(pace_apply_work, pace_apply_work_cb);
+static K_WORK_DELAYABLE_DEFINE(pace_idle_work, pace_idle_work_cb);
+
+static void pace_apply_work_cb(struct k_work *work) {
+    bool fast = atomic_get(&pace_fast) != 0;
+    const struct bt_le_conn_param *param =
+        fast ? BT_LE_CONN_PARAM(CONFIG_ZMK_SPLIT_BLE_PREF_INT, CONFIG_ZMK_SPLIT_BLE_PREF_INT,
+                                CONFIG_ZMK_SPLIT_BLE_PREF_LATENCY, CONFIG_ZMK_SPLIT_BLE_PREF_TIMEOUT)
+             : BT_LE_CONN_PARAM(CONFIG_ZMK_SPLIT_BLE_IDLE_INT, CONFIG_ZMK_SPLIT_BLE_IDLE_INT, 0,
+                                CONFIG_ZMK_SPLIT_BLE_PREF_TIMEOUT);
+    bool pending = false;
+
+    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+        struct bt_conn *conn = peripherals[i].conn;
+        if (peripherals[i].state != PERIPHERAL_SLOT_STATE_CONNECTED || conn == NULL) {
+            continue;
+        }
+
+        int err = bt_conn_le_param_update(conn, param);
+        if (err == 0 || err == -EALREADY || err == -ENOTCONN) {
+            continue;
+        }
+
+        LOG_DBG("Split link pace %s not taken by peripheral %d yet (err %d)",
+                fast ? "fast" : "idle", i, err);
+        pending = true;
+    }
+
+    if (!pending) {
+        pace_tries = 0;
+        LOG_DBG("Split link pace: %s", fast ? "fast" : "idle");
+        return;
+    }
+
+    if (++pace_tries < PACE_MAX_TRIES) {
+        k_work_reschedule(&pace_apply_work, PACE_RETRY);
+    } else {
+        LOG_WRN("Split link pace %s gave up after %d tries", fast ? "fast" : "idle",
+                PACE_MAX_TRIES);
+        pace_tries = 0;
+    }
+}
+
+static void pace_idle_work_cb(struct k_work *work) {
+    atomic_set(&pace_fast, 0);
+    k_work_reschedule(&pace_apply_work, K_NO_WAIT);
+}
+
+void zmk_split_bt_central_note_activity(void) {
+    k_work_reschedule(&pace_idle_work, K_MSEC(CONFIG_ZMK_SPLIT_BLE_IDLE_TIMEOUT_MS));
+    if (atomic_cas(&pace_fast, 0, 1)) {
+        k_work_reschedule(&pace_apply_work, K_NO_WAIT);
+    }
+}
+
+/*
+ * The link reports what it actually changed to. bt_conn_le_param_update
+ * compares a request against the parameters in force, not the ones in
+ * flight, so a request to go fast that lands within the six events of a
+ * change to idle is answered -EALREADY and the link slows anyway. This is
+ * the check that catches it: an update that lands on an interval other than
+ * the wanted one is simply re-requested. The callbacks are registered for
+ * every connection, host included, so only the peripherals' are looked at.
+ */
+static void pace_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency,
+                                  uint16_t timeout) {
+    if (peripheral_slot_index_for_conn(conn) < 0) {
+        return;
+    }
+
+    uint16_t want = atomic_get(&pace_fast) ? CONFIG_ZMK_SPLIT_BLE_PREF_INT
+                                           : CONFIG_ZMK_SPLIT_BLE_IDLE_INT;
+    LOG_DBG("Split link now interval %u latency %u timeout %u (want %u)", interval, latency,
+            timeout, want);
+    if (interval != want) {
+        k_work_reschedule(&pace_apply_work, K_NO_WAIT);
+    }
+}
+
+/* Keys, sensors and pointer input are activity; housekeeping traffic is not. */
+static bool peripheral_event_is_activity(const struct zmk_split_transport_peripheral_event *ev) {
+    switch (ev->type) {
+    case ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT:
+    case ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_SENSOR_EVENT:
+    case ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_INPUT_EVENT:
+        return true;
+    default:
+        return false;
+    }
+}
+#else
+void zmk_split_bt_central_note_activity(void) {}
+#endif // IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_PACED)
+
 /*
  * Two scan duty cycles. BT_LE_SCAN_PASSIVE in this firmware's Zephyr is 40 ms
  * in every 500 ms (8%), chosen so a central whose peripheral is away does
@@ -226,6 +363,11 @@ static bool peripheral_event_is_stateful(const struct zmk_split_transport_periph
  * error level, because a key will be stuck.
  */
 static void peripheral_event_enqueue(const struct peripheral_event_wrapper *wrapper) {
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_PACED)
+    if (peripheral_event_is_activity(&wrapper->event)) {
+        zmk_split_bt_central_note_activity();
+    }
+#endif
     while (k_msgq_put(&peripheral_event_msgq, wrapper, K_NO_WAIT) != 0) {
         if (!peripheral_event_is_stateful(&wrapper->event)) {
             LOG_DBG("Peripheral event queue full, movement dropped");
@@ -1290,6 +1432,9 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
     LOG_DBG("Connected: %s", addr);
 
     confirm_peripheral_slot_conn(conn);
+    // A new link starts at the fast interval, which service discovery wants;
+    // it slows after the idle timeout like any other.
+    zmk_split_bt_central_note_activity();
     split_central_process_connection(conn);
     k_work_submit(&notify_status_work);
 }
@@ -1353,6 +1498,9 @@ static struct bt_conn_cb conn_callbacks = {
     .connected = split_central_connected,
     .disconnected = split_central_disconnected,
     .security_changed = split_central_security_changed,
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_PACED)
+    .le_param_updated = pace_le_param_updated,
+#endif
 };
 
 K_THREAD_STACK_DEFINE(split_central_split_run_q_stack,

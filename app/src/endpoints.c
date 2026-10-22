@@ -23,6 +23,13 @@
 
 #include <zephyr/logging/log.h>
 
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_PACED)
+#include <zmk/split/bluetooth/central.h>
+#define NOTE_SPLIT_ACTIVITY() zmk_split_bt_central_note_activity()
+#else
+#define NOTE_SPLIT_ACTIVITY()
+#endif
+
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 // Name of the subtree for endpoint-related settings
@@ -249,6 +256,7 @@ static int send_consumer_report(void) {
 
 int zmk_endpoint_send_report(uint16_t usage_page) {
     LOG_DBG("usage page 0x%02X", usage_page);
+    NOTE_SPLIT_ACTIVITY();
     switch (usage_page) {
     case HID_USAGE_KEY:
         return send_keyboard_report();
@@ -263,6 +271,7 @@ int zmk_endpoint_send_report(uint16_t usage_page) {
 
 #if IS_ENABLED(CONFIG_ZMK_POINTING)
 int zmk_endpoint_send_mouse_report() {
+    NOTE_SPLIT_ACTIVITY();
     switch (current_instance.transport) {
     case ZMK_TRANSPORT_NONE:
         return 0;
