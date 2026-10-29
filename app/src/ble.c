@@ -322,17 +322,29 @@ bt_addr_le_t *zmk_ble_profile_address(uint8_t index) {
     return &profiles[index].peer;
 }
 
-#if IS_ENABLED(CONFIG_SETTINGS)
-static void ble_save_profile_work(struct k_work *work) {
-    settings_save_one("ble/active_profile", &active_profile, sizeof(active_profile));
-}
-
-static struct k_work_delayable ble_save_work;
-#endif
-
+/*
+ * The active profile is written to flash the moment it changes, not after
+ * the CONFIG_ZMK_SETTINGS_SAVE_DEBOUNCE (60 s) that ZMK applies to it.
+ *
+ * The debounce guards the flash against someone cycling &bt BT_NXT, but a
+ * profile change is a byte a few times a day, and NVS spreads those writes
+ * over the whole settings partition; the wear is nothing. What the debounce
+ * cost was real: a keyboard that went to sleep, was switched off at its
+ * power switch, or lost its cells within a minute of the change came back
+ * on the profile it had before. ErgoTrack has been waking from deep sleep
+ * on profile 0 whatever was in use (2026-10); this removes the one way the
+ * firmware itself can lose the change. The write is synchronous and the
+ * result is logged, and so is the value restored at boot, so a save the
+ * partition refused shows up in the log rather than as a keyboard that
+ * forgets.
+ */
 static int ble_save_profile(void) {
 #if IS_ENABLED(CONFIG_SETTINGS)
-    return k_work_reschedule(&ble_save_work, K_MSEC(CONFIG_ZMK_SETTINGS_SAVE_DEBOUNCE));
+    int err = settings_save_one("ble/active_profile", &active_profile, sizeof(active_profile));
+    if (err) {
+        LOG_ERR("Failed to save active profile %d (err %d)", active_profile, err);
+    }
+    return err;
 #else
     return 0;
 #endif
@@ -522,6 +534,7 @@ static int ble_profiles_handle_set(const char *name, size_t len, settings_read_c
             LOG_ERR("Failed to handle active profile from settings (err %d)", err);
             return err;
         }
+        LOG_INF("Active profile %d restored from settings", active_profile);
     }
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
     else if (settings_name_steq(name, "peripheral_addresses", &next) && next) {
@@ -799,7 +812,6 @@ static int zmk_ble_init(void) {
 
 #if IS_ENABLED(CONFIG_SETTINGS)
     settings_register(&profiles_handler);
-    k_work_init_delayable(&ble_save_work, ble_save_profile_work);
 #else
     zmk_ble_complete_startup();
 #endif
