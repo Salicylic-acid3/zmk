@@ -27,6 +27,20 @@ properties:
     type: int
     default: 5
     description: Debounce time for key release in milliseconds.
+  debounce-release-held-ms:
+    type: int
+    default: 0
+    description: |
+      Debounce time for the release of a key that has been held for at least
+      debounce-held-threshold-ms, in milliseconds. 0 (the default) uses
+      debounce-release-ms for every release. A longer window here absorbs a
+      contact that opens for a moment while a key is held (snap-action and
+      mouse switches do this) without touching quick double taps, which
+      start from a short press.
+  debounce-held-threshold-ms:
+    type: int
+    default: 0
+    description: How long a key must have been pressed, in milliseconds, before debounce-release-held-ms applies.
   debounce-scan-period-ms:
     type: int
     default: 1

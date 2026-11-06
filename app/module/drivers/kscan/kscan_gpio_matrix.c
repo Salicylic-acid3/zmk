@@ -45,6 +45,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
     DT_INST_PROP_OR(n, debounce_period, DT_INST_PROP(n, debounce_release_ms))
 #endif
 
+#define INST_DEBOUNCE_RELEASE_HELD_MS(n) DT_INST_PROP(n, debounce_release_held_ms)
+#define INST_DEBOUNCE_HELD_THRESHOLD_MS(n) DT_INST_PROP(n, debounce_held_threshold_ms)
+
 #define USE_POLLING IS_ENABLED(CONFIG_ZMK_KSCAN_MATRIX_POLLING)
 #define USE_INTERRUPTS (!USE_POLLING)
 
@@ -497,6 +500,8 @@ static const struct kscan_driver_api kscan_matrix_api = {
                  "ZMK_KSCAN_DEBOUNCE_PRESS_MS or debounce-press-ms is too large");                 \
     BUILD_ASSERT(INST_DEBOUNCE_RELEASE_MS(n) <= DEBOUNCE_COUNTER_MAX,                              \
                  "ZMK_KSCAN_DEBOUNCE_RELEASE_MS or debounce-release-ms is too large");             \
+    BUILD_ASSERT(INST_DEBOUNCE_RELEASE_HELD_MS(n) <= DEBOUNCE_COUNTER_MAX,                         \
+                 "debounce-release-held-ms is too large");                                         \
                                                                                                    \
     static struct kscan_gpio kscan_matrix_rows_##n[] = {                                           \
         LISTIFY(INST_ROWS_LEN(n), KSCAN_GPIO_ROW_CFG_INIT, (, ), n)};                              \
@@ -524,6 +529,8 @@ static const struct kscan_driver_api kscan_matrix_api = {
             {                                                                                      \
                 .debounce_press_ms = INST_DEBOUNCE_PRESS_MS(n),                                    \
                 .debounce_release_ms = INST_DEBOUNCE_RELEASE_MS(n),                                \
+                .debounce_release_held_ms = INST_DEBOUNCE_RELEASE_HELD_MS(n),                      \
+                .debounce_held_threshold_ms = INST_DEBOUNCE_HELD_THRESHOLD_MS(n),                  \
             },                                                                                     \
         .debounce_scan_period_ms = DT_INST_PROP(n, debounce_scan_period_ms),                       \
         .poll_period_ms = DT_INST_PROP(n, poll_period_ms),                                         \

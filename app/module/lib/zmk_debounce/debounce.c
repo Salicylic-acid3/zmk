@@ -8,7 +8,22 @@
 
 static uint32_t get_threshold(const struct zmk_debounce_state *state,
                               const struct zmk_debounce_config *config) {
-    return state->pressed ? config->debounce_release_ms : config->debounce_press_ms;
+    if (!state->pressed) {
+        return config->debounce_press_ms;
+    }
+    if (config->debounce_release_held_ms > 0 &&
+        state->held_ms >= config->debounce_held_threshold_ms) {
+        return config->debounce_release_held_ms;
+    }
+    return config->debounce_release_ms;
+}
+
+static void accumulate_held(struct zmk_debounce_state *state, const int elapsed_ms) {
+    if (state->held_ms + elapsed_ms > UINT16_MAX) {
+        state->held_ms = UINT16_MAX;
+    } else {
+        state->held_ms += elapsed_ms;
+    }
 }
 
 static void increment_counter(struct zmk_debounce_state *state, const int elapsed_ms) {
@@ -37,6 +52,9 @@ void zmk_debounce_update(struct zmk_debounce_state *state, const bool active, co
     state->changed = false;
 
     if (active == state->pressed) {
+        if (active) {
+            accumulate_held(state, elapsed_ms);
+        }
         decrement_counter(state, elapsed_ms);
         return;
     }
@@ -51,6 +69,9 @@ void zmk_debounce_update(struct zmk_debounce_state *state, const bool active, co
     state->pressed = !state->pressed;
     state->counter = 0;
     state->changed = true;
+    if (state->pressed) {
+        state->held_ms = 0;
+    }
 }
 
 bool zmk_debounce_is_active(const struct zmk_debounce_state *state) {
