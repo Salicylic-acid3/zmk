@@ -62,6 +62,18 @@ config ZMK_SPLIT_BLE_CENTRAL_SPLIT_RUN_QUEUE_SIZE
     int "Max number of behavior run events to queue to send to the peripheral(s)"
     default 5
 
+config ZMK_SPLIT_BLE_CENTRAL_RELAY_EVENT_STACK_SIZE
+    int "BLE split central relay event write thread stack size"
+    default 2048
+    depends on ZMK_SPLIT_RELAY_EVENT
+    help
+      Relay events to the peripherals are written from a thread of their own.
+      On the system work queue the Bluetooth host may not wait for a transmit
+      buffer, so a relay event that takes several writes lost one of them
+      whenever the buffers were busy, and with it the whole event. The thread
+      holds one queued relay event (about DATA_LEN bytes) on its stack on top
+      of the Bluetooth host's write path.
+
 config ZMK_SPLIT_BLE_PREF_INT
     int "Connection interval to use for split central/peripheral connection"
     default 6

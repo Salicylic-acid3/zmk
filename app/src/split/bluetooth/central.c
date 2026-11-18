@@ -561,6 +561,27 @@ K_MSGQ_DEFINE(relay_event_msgq, sizeof(struct relay_event_wrapper),
               CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, 4);
 K_WORK_DEFINE(update_peripherals_relay_event_work, update_peripherals_relay_event_work_handler);
 
+/*
+ * Relay events go out from a work queue of their own, not the system one.
+ *
+ * An event larger than one ATT write is sent as several chunks, one
+ * Write Without Response each. On the system work queue the Bluetooth host
+ * will not wait for a transmit buffer (bt_att_chan_create_pdu: "No blocking
+ * in the sysqueue"), so when the shared ATT pool was busy -- notifications to
+ * the host, the previous chunks still in flight -- a chunk failed with
+ * -ENOMEM and the whole event was dropped (logged, nothing more). That is
+ * the likely reason ClickBoard ErgoTrack's left half never saw a
+ * custom-settings request -- the full ~256-byte struct, five chunks at an
+ * MTU of 65 -- while small one-chunk events such as the key-switch stats
+ * query got through. A peripheral sends its relay events from its own
+ * service work queue, which may wait, and that direction works.
+ *
+ * Here the write waits for a buffer instead. Nothing else runs on this
+ * queue, so waiting holds up only later relay events.
+ */
+K_THREAD_STACK_DEFINE(relay_event_tx_q_stack, CONFIG_ZMK_SPLIT_BLE_CENTRAL_RELAY_EVENT_STACK_SIZE);
+static struct k_work_q relay_event_tx_q;
+
 static int split_central_bt_queue_relay_event(uint8_t source,
                                               const struct zmk_split_relay_event_payload *payload) {
     struct relay_event_wrapper wrapper = {.source = source, .payload = *payload};
@@ -569,7 +590,7 @@ static int split_central_bt_queue_relay_event(uint8_t source,
         LOG_ERR("Failed to queue relay event to send (%d)", err);
         return err;
     }
-    k_work_submit(&update_peripherals_relay_event_work);
+    k_work_submit_to_queue(&relay_event_tx_q, &update_peripherals_relay_event_work);
     return 0;
 }
 
@@ -661,7 +682,7 @@ static void update_peripherals_relay_event_work_handler(struct k_work *_work) {
     }
 
     if (k_msgq_num_used_get(&relay_event_msgq) > 0) {
-        k_work_submit(&update_peripherals_relay_event_work);
+        k_work_submit_to_queue(&relay_event_tx_q, &update_peripherals_relay_event_work);
     }
 }
 
@@ -1639,6 +1660,12 @@ static int zmk_split_bt_central_init(void) {
     k_work_queue_start(&split_central_split_run_q, split_central_split_run_q_stack,
                        K_THREAD_STACK_SIZEOF(split_central_split_run_q_stack),
                        CONFIG_ZMK_BLE_THREAD_PRIORITY, NULL);
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_RELAY_EVENT)
+    k_work_queue_start(&relay_event_tx_q, relay_event_tx_q_stack,
+                       K_THREAD_STACK_SIZEOF(relay_event_tx_q_stack),
+                       CONFIG_ZMK_BLE_THREAD_PRIORITY, NULL);
+    k_thread_name_set(&relay_event_tx_q.thread, "split_relay_tx");
+#endif
     bt_conn_cb_register(&conn_callbacks);
 
 #if IS_ENABLED(CONFIG_SETTINGS)
