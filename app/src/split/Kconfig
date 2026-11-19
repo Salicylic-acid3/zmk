@@ -47,9 +47,15 @@ config ZMK_SPLIT_RELAY_EVENT_TYPE_NAME_LEN
 config ZMK_SPLIT_RELAY_EVENT_DATA_LEN
     int "Maximum size of event payload to relay in bytes"
     default 128
+    range 1 255
     help
         Maximum size of the event data payload that can be sent between
         peripheral and central via relay events.
+
+        At most 255: the relay header carries the data size in one byte
+        (relay_event_header.event_data_size). With 256, an event struct of
+        exactly 256 bytes goes out with a size of 0 and the receiver drops
+        it ("Relay event data size mismatch ... got 0").
 endif # ZMK_SPLIT_RELAY_EVENT
 
 endif # ZMK_SPLIT
